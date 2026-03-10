@@ -19,6 +19,7 @@ OPENCLAW_USER="${OPENCLAW_PODMAN_USER:-openclaw}"
 REPO_PATH="${OPENCLAW_REPO_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 RUN_SCRIPT_SRC="$REPO_PATH/scripts/run-openclaw-podman.sh"
 QUADLET_TEMPLATE="$REPO_PATH/scripts/podman/openclaw.container.in"
+IMAGE_NAME="${OPENCLAW_IMAGE:-openclaw:local}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -238,13 +239,22 @@ if run_as_openclaw test -f "$ENV_FILE"; then
     printf 'OPENCLAW_GATEWAY_TOKEN=%s\n' "$TOKEN" | run_as_openclaw tee -a "$ENV_FILE" >/dev/null
     echo "Added OPENCLAW_GATEWAY_TOKEN to $ENV_FILE."
   fi
-  run_as_openclaw chmod 600 "$ENV_FILE" 2>/dev/null || true
 else
   TOKEN="$(generate_token_hex_32)"
   printf 'OPENCLAW_GATEWAY_TOKEN=%s\n' "$TOKEN" | run_as_openclaw tee "$ENV_FILE" >/dev/null
-  run_as_openclaw chmod 600 "$ENV_FILE" 2>/dev/null || true
   echo "Created $ENV_FILE with new token."
 fi
+
+# Upsert OPENCLAW_PODMAN_IMAGE to ensure it loads the correct image on startup
+TMP_ENV_FILE="$OPENCLAW_CONFIG/.env.tmp"
+run_as_openclaw awk -v img="$IMAGE_NAME" '
+  BEGIN { found = 0 }
+  /^OPENCLAW_PODMAN_IMAGE=/ { print "OPENCLAW_PODMAN_IMAGE=" img; found = 1; next }
+  { print }
+  END { if (!found) print "OPENCLAW_PODMAN_IMAGE=" img }
+' "$ENV_FILE" | run_as_openclaw tee "$TMP_ENV_FILE" >/dev/null
+run_as_openclaw mv "$TMP_ENV_FILE" "$ENV_FILE"
+run_as_openclaw chmod 600 "$ENV_FILE" 2>/dev/null || true
 
 # The gateway refuses to start unless gateway.mode=local is set in config.
 # Make first-run non-interactive; users can run the wizard later to configure channels/providers.
@@ -255,11 +265,19 @@ if ! run_as_openclaw test -f "$OPENCLAW_JSON"; then
   echo "Created $OPENCLAW_JSON (minimal gateway.mode=local)."
 fi
 
-echo "Building image from $REPO_PATH..."
-BUILD_ARGS=()
-[[ -n "${OPENCLAW_DOCKER_APT_PACKAGES:-}" ]] && BUILD_ARGS+=(--build-arg "OPENCLAW_DOCKER_APT_PACKAGES=${OPENCLAW_DOCKER_APT_PACKAGES}")
-[[ -n "${OPENCLAW_EXTENSIONS:-}" ]] && BUILD_ARGS+=(--build-arg "OPENCLAW_EXTENSIONS=${OPENCLAW_EXTENSIONS}")
-podman build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t openclaw:local -f "$REPO_PATH/Dockerfile" "$REPO_PATH"
+if [[ "$IMAGE_NAME" == "openclaw:local" ]]; then
+  echo "Building image from $REPO_PATH..."
+  BUILD_ARGS=()
+  [[ -n "${OPENCLAW_DOCKER_APT_PACKAGES:-}" ]] && BUILD_ARGS+=(--build-arg "OPENCLAW_DOCKER_APT_PACKAGES=${OPENCLAW_DOCKER_APT_PACKAGES}")
+  [[ -n "${OPENCLAW_EXTENSIONS:-}" ]] && BUILD_ARGS+=(--build-arg "OPENCLAW_EXTENSIONS=${OPENCLAW_EXTENSIONS}")
+  podman build ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t "$IMAGE_NAME" -f "$REPO_PATH/Dockerfile" "$REPO_PATH"
+else
+  echo "Pulling image: $IMAGE_NAME..."
+  if ! podman pull "$IMAGE_NAME"; then
+    echo "ERROR: Failed to pull image $IMAGE_NAME." >&2
+    exit 1
+  fi
+fi
 
 echo "Loading image into $OPENCLAW_USER's Podman store..."
 TMP_IMAGE_DIR="$(resolve_image_tmp_dir)"
@@ -268,7 +286,7 @@ TMP_STAGE_DIR="$(mktemp -d -p "$TMP_IMAGE_DIR" openclaw-image.XXXXXX)"
 TMP_IMAGE="$TMP_STAGE_DIR/image.tar"
 chmod 700 "$TMP_STAGE_DIR"
 trap 'rm -rf "$TMP_STAGE_DIR"' EXIT
-podman save openclaw:local -o "$TMP_IMAGE"
+podman save "$IMAGE_NAME" -o "$TMP_IMAGE"
 chmod 600 "$TMP_IMAGE"
 # Stream the image into the target user's podman load so private temp directories
 # do not need to be traversable by $OPENCLAW_USER.
@@ -286,7 +304,8 @@ if [[ "$INSTALL_QUADLET" == true && -f "$QUADLET_TEMPLATE" ]]; then
   echo "Installing systemd quadlet for $OPENCLAW_USER..."
   run_as_openclaw mkdir -p "$QUADLET_DIR"
   OPENCLAW_HOME_SED="$(escape_sed_replacement_pipe_delim "$OPENCLAW_HOME")"
-  sed "s|{{OPENCLAW_HOME}}|$OPENCLAW_HOME_SED|g" "$QUADLET_TEMPLATE" | run_as_openclaw tee "$QUADLET_DIR/openclaw.container" >/dev/null
+  IMAGE_NAME_SED="$(escape_sed_replacement_pipe_delim "$IMAGE_NAME")"
+  sed "s|{{OPENCLAW_HOME}}|$OPENCLAW_HOME_SED|g; s|{{IMAGE_NAME}}|$IMAGE_NAME_SED|g" "$QUADLET_TEMPLATE" | run_as_openclaw tee "$QUADLET_DIR/openclaw.container" >/dev/null
   run_as_openclaw chmod 700 "$OPENCLAW_HOME/.config" "$OPENCLAW_HOME/.config/containers" "$QUADLET_DIR" 2>/dev/null || true
   run_as_openclaw chmod 600 "$QUADLET_DIR/openclaw.container" 2>/dev/null || true
   if command -v systemctl &>/dev/null; then
