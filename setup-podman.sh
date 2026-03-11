@@ -128,7 +128,7 @@ require_cmd podman
 if ! is_root; then
   require_cmd sudo
 fi
-if [[ ! -f "$REPO_PATH/Dockerfile" ]]; then
+if [[ "$IMAGE_NAME" == "openclaw:local" && ! -f "$REPO_PATH/Dockerfile" ]]; then
   echo "Dockerfile not found at $REPO_PATH. Set OPENCLAW_REPO_PATH to the repo root." >&2
   exit 1
 fi
